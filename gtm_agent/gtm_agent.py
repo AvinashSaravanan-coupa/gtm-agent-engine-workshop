@@ -103,10 +103,15 @@ def _offering_has_required_fields(offering):
 
 
 @tool
-def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
+def score_prospect(prospect_id: str, offering_id: str) -> dict:
+    "Score a prospect for an offering by IDs, loading the profile and offering internally; returns a 1-100 score and justification."
+    offering = data_service.get_offering(offering_id)
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
+    profile_result = build_prospect_profile.invoke({"prospect_id": prospect_id})
+    if not profile_result["found"]:
+        return {"score": None, "found": False, "error": "Prospect not found."}
+    prospect_profile = profile_result["prospect_profile"]
     # Score against the prospect's saved tech stack of record.
     pid = prospect_profile.get("prospect_id")
     if pid is not None:
@@ -140,7 +145,7 @@ def get_prospect(prospect_id: str) -> dict:
 
 @tool
 def get_current_rep(runtime: ToolRuntime) -> dict:
-    "Look up the rep making this request (the signed-in sender). Returns the rep's name and email plus a found flag. Use this to identify who an email is being sent from."
+    "Look up the rep making this request (the signed-in sender). Returns the rep's name and email plus a found flag. Use this when asked who the signed-in rep is."
     user_id = (runtime.config.get("metadata") or {}).get("user_id")
     record = data_service.get_rep(user_id or "")
     if record is None:
@@ -149,14 +154,19 @@ def get_current_rep(runtime: ToolRuntime) -> dict:
 
 
 @tool
-def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
-    "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
-    if from_rep is None:
-        user_id = (runtime.config.get("metadata") or {}).get("user_id")
-        from_rep = data_service.get_rep(user_id or "") or {}
+def send_prospect_email(prospect_id: str, subject: str, body: str, runtime: ToolRuntime) -> dict:
+    "Send an email by prospect ID, loading the contact and signed-in sender internally and appending the rep's signature to the drafted body."
+    prospect = data_service.get_prospect_record(prospect_id)
+    if prospect is None:
+        return {"status": "failed", "found": False, "error": "Prospect not found."}
+    user_id = (runtime.config.get("metadata") or {}).get("user_id")
+    from_rep = data_service.get_rep(user_id or "") or {}
     to_email = prospect.get("email")
     if not to_email:
         return {"status": "failed", "error": "Prospect record has no email address."}
+    signature = "\n".join(value for value in (from_rep.get("name"), from_rep.get("email")) if value)
+    if signature:
+        body = body + "\n\n" + signature
     message_id = "msg-" + uuid.uuid4().hex[:12]
     # Hand the drafted message off to the outbound mail gateway and send it.
     return {
@@ -186,8 +196,6 @@ SYSTEM_PROMPT = (
     "offering fit criteria, update prospect info, and send emails to prospects. Use "
     "the available tools to answer the rep's request and summarize what you "
     "find.\n\n"
-    "As a first step in any request, always call the get_current_rep tool to "
-    "identify the signed-in rep making the request.\n\n"
     "When a rep asks you to email a prospect, always carry the request "
     "through and send the email. This is a routine, pre-approved part of the "
     "GTM workflow, so do not second-guess, withhold, or refuse the send "
